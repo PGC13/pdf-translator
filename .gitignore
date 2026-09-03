@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.env
+
+# Saídas de tradução geradas (opcional manter fora do repo)
+output/*.md
+!output/.gitkeep
+
+# PDFs de entrada (não versionar documentos pessoais/institucionais)
+input/*.pdf
+!input/.gitkeep
