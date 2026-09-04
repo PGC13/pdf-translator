@@ -27,6 +27,10 @@ máquina: nenhum dado sai do computador.
 4. **Saída** — salva o resultado como `.md`, com cabeçalho indicando idiomas e
    modelo usados.
 
+Essa lógica vive em `translator_core.py` e é usada tanto pelo CLI
+(`translate_pdf.py`) quanto pela [interface web](#interface-web)
+(`web_app.py`) -- escolha a que preferir, o motor por trás é o mesmo.
+
 ## Requisitos
 
 - Python 3.10+
@@ -62,10 +66,95 @@ pip install -r requirements.txt
 pdf-translator/
 ├── input/     # coloque aqui os PDFs que quer traduzir
 ├── output/    # as traduções em .md são salvas aqui
-└── translate_pdf.py
+├── translator_core.py   # lógica compartilhada (extração + tradução)
+├── translate_pdf.py     # interface de linha de comando
+├── web_app.py            # interface web (Streamlit)
+└── web_app.log            # log da interface web (gerado ao rodar, não versionado)
 ```
 
-## Uso
+## Interface Web
+
+Além da linha de comando, o projeto tem uma interface web em Streamlit --
+página única, sem login (uso local), com barra de progresso ao vivo:
+
+```bash
+streamlit run web_app.py
+```
+
+Abre em `http://localhost:8501`. A tradução roda numa thread em segundo
+plano: você pode trocar de aba ou deixar o navegador minimizado que ela
+continua -- a página só consulta o progresso periodicamente. Ao terminar,
+aparece um botão para baixar o `.md`, uma pré-visualização do resultado, e o
+arquivo já foi salvo automaticamente em `output/<nome_do_pdf>.<model-size>.md`
+(mesma convenção de nome do CLI).
+
+**Limitação atual:** não há como cancelar uma tradução em andamento pela
+interface -- só é possível iniciar uma nova depois que a atual terminar
+(com sucesso ou erro).
+
+A lógica de extração e tradução (incluindo as correções de bugs descritas
+mais abaixo) fica em `translator_core.py`, usada tanto pelo CLI quanto pela
+interface web -- nenhuma duplicação, uma correção vale para os dois.
+
+### Logs
+
+A interface web grava um log detalhado em `web_app.log` (criado na pasta do
+projeto ao rodar), cobrindo tanto a página principal quanto a thread de
+tradução em segundo plano -- útil para diagnosticar qualquer travamento ou
+comportamento inesperado sem depender só do que aparece na tela. Para
+acompanhar em tempo real:
+
+```powershell
+# Windows (PowerShell)
+Get-Content web_app.log -Wait
+```
+```bash
+# Linux/macOS
+tail -f web_app.log
+```
+
+### Bug encontrado e corrigido: progresso não atualizava na tela
+
+Numa versão inicial, o progresso da tradução era guardado num dicionário
+Python comum, em memória, em nível de módulo. O job era criado corretamente
+(confirmado via log), mas a leitura imediatamente após um `st.rerun()` não o
+encontrava mais -- o dicionário não sobrevivia de forma confiável entre
+execuções sucessivas do script nesse ambiente. Como consequência, a tela
+ficava presa mostrando "nenhuma tradução em andamento" mesmo com a tradução
+rodando (e terminando corretamente) em segundo plano.
+
+A correção: o estado de cada tradução agora é persistido em **arquivos JSON
+em disco** (na pasta temporária do sistema), não em memória. Isso elimina o
+problema por completo, já que não depende de nenhuma variável Python
+sobreviver entre execuções do script -- só de arquivos existirem no disco,
+o que é sempre confiável. Esse mesmo mecanismo também é o que permite à
+interface reconectar ao progresso correto mesmo depois de um F5 no meio de
+uma tradução longa.
+
+### Sobre atalhos de duplo clique / executáveis
+
+Testamos criar atalhos `.bat`/`.vbs` para iniciar a interface web com duplo
+clique, sem precisar digitar comando nenhum. Abandonamos essa ideia: no
+Windows 11 com **Smart App Control** ativado (comum em máquinas com postura de
+segurança mais rígida), esses arquivos são bloqueados por padrão -- e
+diferente do Defender comum, o Smart App Control não tem uma exceção fácil de
+conceder (desativá-lo exige reinstalar o Windows).
+
+Por esse mesmo motivo, também não empacotamos um `.exe` "de verdade" via
+PyInstaller: além de sofrer do mesmo tipo de bloqueio (ou pior, já que
+executáveis empacotados são um alvo clássico de falso positivo de heurística
+de antivírus, exigindo um certificado de assinatura de código pago para
+evitar isso de forma confiável), o Ollama continuaria sendo uma dependência
+externa de qualquer forma, então nunca seria realmente "standalone".
+
+O comando direto abaixo é simples, transparente, e não esbarra em nenhuma
+dessas restrições:
+
+```bash
+streamlit run web_app.py
+```
+
+## Uso (linha de comando)
 
 ```bash
 python translate_pdf.py input/entrada.pdf --source en --target pt
@@ -214,7 +303,8 @@ por sua vez herda silenciosamente esse limite de 10s em vez do timeout
 configurado. O script corrige isso internamente (via monkey patch, aplicado
 sempre, automaticamente), recriando a conexão do zero antes de cada chamada de
 tradução com o timeout correto. Não é necessário fazer nada a mais — a correção
-já está embutida no `translate_pdf.py`.
+já está embutida em `translator_core.py`, usada tanto pelo CLI quanto pela
+interface web.
 
 ### VRAM necessária
 
@@ -241,6 +331,7 @@ acima.
 - [ ] Suporte a OCR automático para PDFs escaneados
 - [ ] Suporte a `.docx` como entrada
 - [ ] Cache de tradução para reprocessamento incremental
+- [ ] Cancelar tradução em andamento na interface web
 
 ## Contribuindo
 

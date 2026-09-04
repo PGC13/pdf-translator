@@ -5,6 +5,12 @@ venv/
 *.egg-info/
 .env
 
+# Log da interface web (gerado em tempo de execução, não deve ser versionado)
+web_app.log
+
+# Configuração/segredos locais do Streamlit, se algum dia forem usados
+.streamlit/
+
 # Saídas de tradução geradas (opcional manter fora do repo)
 output/*.md
 !output/.gitkeep
