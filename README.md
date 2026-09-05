@@ -96,6 +96,9 @@ A lógica de extração e tradução (incluindo as correções de bugs descritas
 mais abaixo) fica em `translator_core.py`, usada tanto pelo CLI quanto pela
 interface web -- nenhuma duplicação, uma correção vale para os dois.
 
+<details>
+<summary><strong>Logs, bug de progresso corrigido, e por que não há executável (clique para expandir)</strong></summary>
+
 ### Logs
 
 A interface web grava um log detalhado em `web_app.log` (criado na pasta do
@@ -153,6 +156,8 @@ dessas restrições:
 ```bash
 streamlit run web_app.py
 ```
+
+</details>
 
 ## Uso (linha de comando)
 
@@ -213,6 +218,9 @@ sequência de texto corrido, removendo a hifenização de quebra de linha. Só
 respeita como quebra de parágrafo real as linhas em branco já presentes na
 extração.
 
+<details>
+<summary><strong>Nota técnica: por que não detectar parágrafos por comprimento de linha</strong></summary>
+
 **Nota técnica:** uma primeira versão tentava detectar automaticamente o fim
 de cada parágrafo por comprimento de linha ("linha bem mais curta que o padrão
 da página"). Isso pareceu funcionar em testes sintéticos, mas falhou em PDFs
@@ -223,6 +231,11 @@ chamadas à API (cada fragmento pequeno virava uma chamada separada ao Ollama).
 A abordagem atual, mais simples, evita esse problema: junta tudo que não tem
 quebra em branco explícita, mesmo que isso ocasionalmente junte um
 título/lista de autores ao parágrafo seguinte em vez de mantê-los separados.
+
+</details>
+
+<details>
+<summary><strong>📊 Qual tamanho de modelo escolher — benchmarks completos (clique para expandir)</strong></summary>
 
 ## Qual tamanho de modelo escolher
 
@@ -325,6 +338,8 @@ parte da VRAM, feche-os antes de rodar o script, ou use um modelo menor. Se o
 modelo não couber inteiramente na VRAM, o Ollama descarrega parte dele para a
 CPU/RAM do sistema, o que é a causa dos tempos muito mais altos mostrados
 acima.
+
+</details>
 
 ## Roadmap
 
