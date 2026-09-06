@@ -7,6 +7,14 @@ Tradução de PDFs 100% local, sem depender de nenhuma API externa ou serviço d
 Extrai o texto de um PDF e traduz usando [TranslateGemma](https://ollama.com/library/translategemma)
 rodando via [Ollama](https://ollama.com), salvando o resultado em Markdown.
 
+## Capturas de tela
+
+<p align="center">
+  <img src="docs/screenshots/web-idle.png" alt="Interface web, pronta para uso" width="32%">
+  <img src="docs/screenshots/web-translating.png" alt="Tradução em andamento" width="32%">
+  <img src="docs/screenshots/web-completed.png" alt="Tradução concluída, pronta para baixar" width="32%">
+</p>
+
 ## Por quê
 
 Ferramentas de tradução em nuvem (Google Translate, DeepL, etc.) exigem enviar o
@@ -164,6 +172,10 @@ streamlit run web_app.py
 ```bash
 python translate_pdf.py input/entrada.pdf --source en --target pt
 ```
+
+<p align="center">
+  <img src="docs/screenshots/cli-progress.png" alt="Barra de progresso no terminal, do início à conclusão" width="70%">
+</p>
 
 O resultado é salvo automaticamente em `output/entrada.<model-size>.md` (ex:
 `entrada.4b.md`). Use `--out` para escolher outro caminho.
