@@ -34,8 +34,12 @@ import sys
 from pathlib import Path
 
 from translator_core import (
+    HtmlConversionError,
+    PdfConversionError,
     Progress,
     build_output_markdown,
+    convert_markdown_to_html,
+    convert_markdown_to_pdf,
     default_output_path,
     parse_page_range,
     translate_document,
@@ -133,6 +137,25 @@ async def run(args: argparse.Namespace) -> None:
 
     print(f"Concluído. Tradução salva em: {out_path}")
 
+    if args.to_pdf:
+        pdf_out_path = out_path.with_suffix(".pdf")
+        print("Convertendo para PDF (pandoc + wkhtmltopdf)...")
+        try:
+            convert_markdown_to_pdf(out_path, pdf_out_path, title=pdf_path.stem)
+            print(f"PDF salvo em: {pdf_out_path}")
+        except PdfConversionError as exc:
+            print(f"Aviso: não foi possível gerar o PDF ({exc})", file=sys.stderr)
+
+    if args.to_html:
+        html_out_path = out_path.with_suffix(".html")
+        print("Convertendo para HTML...")
+        try:
+            html_content = convert_markdown_to_html(final_markdown, title=pdf_path.stem)
+            html_out_path.write_text(html_content, encoding="utf-8")
+            print(f"HTML salvo em: {html_out_path}")
+        except HtmlConversionError as exc:
+            print(f"Aviso: não foi possível gerar o HTML ({exc})", file=sys.stderr)
+
 
 def main() -> None:
     _enable_windows_ansi()
@@ -175,6 +198,24 @@ def main() -> None:
             "A biblioteca usa 60s por padrão, insuficiente para modelos que não "
             "cabem na VRAM da GPU e caem para CPU. Aumente este valor (ex: 300) "
             "se ocorrer erro OLLAMA_TIMEOUT mesmo com --chunk-size reduzido."
+        ),
+    )
+    parser.add_argument(
+        "--to-pdf",
+        action="store_true",
+        help=(
+            "Além do .md, também gera um .pdf (mesmo nome, na mesma pasta). "
+            "Requer pandoc (https://pandoc.org) e wkhtmltopdf "
+            "(https://wkhtmltopdf.org) instalados e no PATH."
+        ),
+    )
+    parser.add_argument(
+        "--to-html",
+        action="store_true",
+        help=(
+            "Além do .md, também gera um .html autocontido (mesmo nome, na "
+            "mesma pasta). Requer a biblioteca 'markdown' (pip install "
+            "markdown) -- sem dependências externas além dessa."
         ),
     )
 

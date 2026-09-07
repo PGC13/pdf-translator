@@ -97,6 +97,13 @@ for the `.md` appears, along with a preview of the result, and the file has
 already been saved automatically to `output/<pdf_name>.<model-size>.md`
 (same naming convention as the CLI).
 
+**Important:** this applies to the **browser tab**, not the terminal. If
+you close the PowerShell window where you ran `streamlit run`, the entire
+process is terminated -- including any translation in progress, with no
+warning or logged error (Windows simply kills everything at once). To run
+another command while a translation is in progress, open a **new**
+PowerShell window instead of closing the one running Streamlit.
+
 **Current limitation:** there's no way to cancel a translation in progress
 from the interface -- you can only start a new one after the current one
 finishes (successfully or with an error).
@@ -192,6 +199,8 @@ The result is saved automatically to `output/entrada.<model-size>.md`
 | `--model-size` | `4b`, `12b`, or `27b` | `4b` |
 | `--chunk-size` | Maximum size (characters) of each chunk sent to the model at a time | automatic (2000/4000/6000 depending on the model) |
 | `--timeout` | Maximum time (seconds) to wait per call to Ollama | 60s (library default) -- see the "Timeout" section below |
+| `--to-pdf` | Also generates a `.pdf` (requires pandoc + wkhtmltopdf) | disabled |
+| `--to-html` | Also generates a self-contained `.html` (only requires the `markdown` lib) | disabled |
 
 ### Examples
 
@@ -353,6 +362,49 @@ the model doesn't fully fit in VRAM, Ollama offloads part of it to
 system CPU/RAM, which is the cause of the much higher times shown above.
 
 </details>
+
+## Generate PDF (optional)
+
+Besides the `.md`, the CLI and the web interface can generate a matching
+`.pdf`, using [pandoc](https://pandoc.org) with the
+[wkhtmltopdf](https://wkhtmltopdf.org) engine. This is an **optional**
+dependency -- only needed if you use this feature; normal translation
+(`.md`) doesn't depend on it.
+
+**Setup** (one time):
+1. [Install pandoc](https://pandoc.org/installing.html)
+2. [Install wkhtmltopdf](https://wkhtmltopdf.org/downloads.html)
+3. Confirm both are on the PATH: `pandoc --version` and `wkhtmltopdf --version`
+
+**CLI:**
+```bash
+python translate_pdf.py input/artigo.pdf --source en --target pt --to-pdf
+```
+Generates `output/artigo.4b.md` **and** `output/artigo.4b.pdf`.
+
+**Web interface:** check the "Também gerar PDF" box under "Opções
+avançadas" before clicking Translate.
+
+If pandoc/wkhtmltopdf aren't installed, the `.md` translation still
+completes normally either way -- only the extra conversion fails, with a
+clear message indicating what to install.
+
+## Generate HTML (optional)
+
+You can also generate a self-contained `.html` (embedded CSS, single file,
+opens in any browser). Unlike PDF, this **needs no external program** --
+just the Python `markdown` library, already included in `requirements.txt`.
+
+**CLI:**
+```bash
+python translate_pdf.py input/artigo.pdf --source en --target pt --to-html
+```
+
+**Web interface:** check the "Também gerar HTML" box.
+
+Since it depends on nothing external, this is the simpler of the two
+options if you just want something more readable than plain `.md` without
+installing anything extra.
 
 ## Roadmap
 

@@ -98,6 +98,13 @@ aparece um botão para baixar o `.md`, uma pré-visualização do resultado, e o
 arquivo já foi salvo automaticamente em `output/<nome_do_pdf>.<model-size>.md`
 (mesma convenção de nome do CLI).
 
+**Importante:** isso vale para a **aba do navegador**, não para o terminal.
+Se você fechar a janela do PowerShell onde rodou `streamlit run`, o processo
+inteiro é encerrado -- incluindo a tradução em andamento, sem nenhum aviso
+ou erro registrado (o Windows simplesmente mata tudo junto). Para rodar
+outro comando enquanto uma tradução está em curso, abra uma **janela nova**
+do PowerShell, sem fechar a que está rodando o Streamlit.
+
 **Limitação atual:** não há como cancelar uma tradução em andamento pela
 interface -- só é possível iniciar uma nova depois que a atual terminar
 (com sucesso ou erro).
@@ -193,6 +200,8 @@ O resultado é salvo automaticamente em `output/entrada.<model-size>.md` (ex:
 | `--model-size` | `4b`, `12b` ou `27b` | `4b` |
 | `--chunk-size` | Tamanho máximo (caracteres) de cada trecho enviado ao modelo por vez | automático (2000/4000/6000 conforme o modelo) |
 | `--timeout` | Tempo máximo (segundos) de espera por chamada ao Ollama | 60s (da biblioteca) -- veja a seção "Timeout" abaixo |
+| `--to-pdf` | Também gera um `.pdf` (requer pandoc + wkhtmltopdf) | desativado |
+| `--to-html` | Também gera um `.html` autocontido (só requer a lib `markdown`) | desativado |
 
 ### Exemplos
 
@@ -354,6 +363,49 @@ CPU/RAM do sistema, o que é a causa dos tempos muito mais altos mostrados
 acima.
 
 </details>
+
+## Gerar PDF (opcional)
+
+Além do `.md`, o CLI e a interface web podem gerar um `.pdf` correspondente,
+usando [pandoc](https://pandoc.org) com o motor
+[wkhtmltopdf](https://wkhtmltopdf.org). É uma dependência **opcional** -- só
+necessária se você usar essa função; a tradução normal (`.md`) não depende
+dela.
+
+**Instalação** (uma vez só):
+1. [Instale o pandoc](https://pandoc.org/installing.html)
+2. [Instale o wkhtmltopdf](https://wkhtmltopdf.org/downloads.html)
+3. Confirme que os dois estão no PATH: `pandoc --version` e `wkhtmltopdf --version`
+
+**CLI:**
+```bash
+python translate_pdf.py input/artigo.pdf --source en --target pt --to-pdf
+```
+Gera `output/artigo.4b.md` **e** `output/artigo.4b.pdf`.
+
+**Interface web:** marque a caixa "Também gerar PDF" em "Opções avançadas"
+antes de clicar em Traduzir.
+
+Se o pandoc/wkhtmltopdf não estiverem instalados, a tradução em `.md` é
+concluída normalmente de qualquer forma -- só a conversão extra falha, com
+uma mensagem clara indicando o que instalar.
+
+## Gerar HTML (opcional)
+
+Também é possível gerar um `.html` autocontido (CSS embutido, um único
+arquivo, abre em qualquer navegador). Ao contrário do PDF, **não precisa de
+nenhum programa externo** -- só a biblioteca Python `markdown`, já incluída
+no `requirements.txt`.
+
+**CLI:**
+```bash
+python translate_pdf.py input/artigo.pdf --source en --target pt --to-html
+```
+
+**Interface web:** marque a caixa "Também gerar HTML".
+
+Como não depende de nada externo, é a opção mais simples das duas caso você
+só queira algo mais legível que o `.md` puro sem instalar mais nada.
 
 ## Roadmap
 

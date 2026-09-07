@@ -4,7 +4,9 @@ web_app.py
 Interface web (Streamlit) para o pdf-translator: página única, sem login,
 100% local. A tradução roda numa thread em segundo plano, independente do
 ciclo de execução do Streamlit -- ela continua mesmo se você trocar de aba
-ou a página recarregar; a interface só consulta o progresso periodicamente.
+do NAVEGADOR ou a página recarregar. Isso NÃO vale para o terminal: fechar
+a janela do PowerShell onde este script está rodando mata o processo
+inteiro, incluindo qualquer tradução em andamento.
 
 O estado de cada tradução é persistido em arquivos JSON em disco (não em
 memória), o que permite reconectar corretamente ao progresso mesmo após um
@@ -29,8 +31,12 @@ from typing import Optional
 import streamlit as st
 
 from translator_core import (
+    HtmlConversionError,
+    PdfConversionError,
     Progress,
     build_output_markdown,
+    convert_markdown_to_html,
+    convert_markdown_to_pdf,
     default_output_path,
     parse_page_range,
     translate_document,
@@ -98,6 +104,12 @@ def _set_job(job_id: str, **updates) -> None:
         except (json.JSONDecodeError, OSError):
             current = {}
     current.update(updates)
+    # Registra sempre quando foi a última escrita -- usado para detectar jobs
+    # "fantasma" (status="running" travado para sempre porque o processo que
+    # fazia a tradução morreu no meio, ex: terminal fechado à força). Sem
+    # isso, reabrir a interface volta a mostrar eternamente "traduzindo...",
+    # mesmo que a thread real já não exista mais.
+    current["last_update"] = time.time()
     # Escreve num arquivo temporário e renomeia por cima (operação atômica no
     # mesmo sistema de arquivos), evitando ler um arquivo pela metade caso
     # duas coisas tentem escrever ao mesmo tempo.
@@ -140,6 +152,8 @@ def _run_translation_job(
     page_range,
     chunk_size: Optional[int],
     timeout: Optional[float],
+    generate_pdf: bool = False,
+    generate_html: bool = False,
 ) -> None:
     """Executa a tradução numa thread separada. Roda seu próprio event loop
     asyncio (independente do event loop principal do Streamlit).
@@ -198,6 +212,33 @@ def _run_translation_job(
         out_path.write_text(final_markdown, encoding="utf-8")
         logger.info(f"[job {job_id}] Salvo em disco: {out_path}")
 
+        pdf_saved_path: Optional[str] = None
+        pdf_error: Optional[str] = None
+        if generate_pdf:
+            pdf_out_path = out_path.with_suffix(".pdf")
+            logger.info(f"[job {job_id}] Convertendo para PDF: {pdf_out_path}")
+            try:
+                convert_markdown_to_pdf(out_path, pdf_out_path, title=original_stem)
+                pdf_saved_path = str(pdf_out_path)
+                logger.info(f"[job {job_id}] PDF salvo em: {pdf_out_path}")
+            except PdfConversionError as exc:
+                pdf_error = str(exc)
+                logger.warning(f"[job {job_id}] Conversão para PDF falhou: {exc}")
+
+        html_saved_path: Optional[str] = None
+        html_error: Optional[str] = None
+        if generate_html:
+            html_out_path = out_path.with_suffix(".html")
+            logger.info(f"[job {job_id}] Convertendo para HTML: {html_out_path}")
+            try:
+                html_content = convert_markdown_to_html(final_markdown, title=original_stem)
+                html_out_path.write_text(html_content, encoding="utf-8")
+                html_saved_path = str(html_out_path)
+                logger.info(f"[job {job_id}] HTML salvo em: {html_out_path}")
+            except HtmlConversionError as exc:
+                html_error = str(exc)
+                logger.warning(f"[job {job_id}] Conversão para HTML falhou: {exc}")
+
         _set_job(
             job_id,
             status="done",
@@ -208,6 +249,12 @@ def _run_translation_job(
             word_count=result.word_count,
             out_filename=f"{original_stem}.{model_size}.md",
             saved_path=str(out_path),
+            pdf_filename=f"{original_stem}.{model_size}.pdf" if pdf_saved_path else None,
+            pdf_saved_path=pdf_saved_path,
+            pdf_error=pdf_error,
+            html_filename=f"{original_stem}.{model_size}.html" if html_saved_path else None,
+            html_saved_path=html_saved_path,
+            html_error=html_error,
         )
         logger.info(f"[job {job_id}] Status atualizado para 'done'.")
     except Exception as exc:  # noqa: BLE001 -- queremos capturar e mostrar qualquer erro na UI
@@ -284,6 +331,27 @@ with st.expander("Opções avançadas"):
         disabled=is_running,
         help="0 = automático, conforme o tamanho do modelo (2000/4000/6000).",
     )
+    generate_pdf = st.checkbox(
+        "Também gerar PDF",
+        value=False,
+        disabled=is_running,
+        help=(
+            "Além do .md, converte o resultado para .pdf usando pandoc + wkhtmltopdf. "
+            "Requer os dois instalados e no PATH (https://pandoc.org e "
+            "https://wkhtmltopdf.org) -- se não estiverem, a tradução ainda é "
+            "concluída normalmente, só a conversão extra falha."
+        ),
+    )
+    generate_html = st.checkbox(
+        "Também gerar HTML",
+        value=False,
+        disabled=is_running,
+        help=(
+            "Além do .md, converte o resultado para .html autocontido. Não "
+            "precisa de nenhum programa externo, só a biblioteca Python "
+            "'markdown' (já incluída em requirements.txt)."
+        ),
+    )
 
 submitted = st.button("Traduzir", disabled=is_running, use_container_width=True, type="primary")
 
@@ -325,6 +393,8 @@ if submitted:
                     page_range=parse_page_range(pages or None),
                     chunk_size=(chunk_size or None),
                     timeout=(timeout or None),
+                    generate_pdf=generate_pdf,
+                    generate_html=generate_html,
                 ),
                 daemon=True,
                 name=f"translate-{job_id[:8]}",
@@ -350,25 +420,42 @@ with status_box:
         status = active_job.get("status")
 
         if status == "running":
-            pct = active_job.get("pct", 0)
-            done = active_job.get("done", 0)
-            total = active_job.get("estimated_total", 1)
-            overflowed = active_job.get("overflowed", False)
-            elapsed = active_job.get("elapsed_s", 0.0)
-            eta = active_job.get("eta_s")
+            last_update = active_job.get("last_update", 0)
+            staleness_s = time.time() - last_update
+            STALE_THRESHOLD_S = 30 * 60  # 30 minutos sem nenhuma atualização = provável travamento
 
-            if done == 0:
-                st.info("⏳ Iniciando -- extraindo texto do PDF e conectando ao Ollama...")
+            if staleness_s > STALE_THRESHOLD_S:
+                st.warning(
+                    "⚠️ Esta tradução parece ter parado inesperadamente "
+                    f"(sem nenhuma atualização há {staleness_s / 60:.0f} minutos). "
+                    "Isso costuma acontecer se o terminal rodando o Streamlit foi "
+                    "fechado no meio da tradução -- o processo é encerrado junto, "
+                    "sem deixar erro registrado. A tradução em si precisa ser refeita."
+                )
+                if st.button("Descartar e começar uma nova tradução"):
+                    st.session_state.job_id = None
+                    _set_latest_job_id(None)
+                    st.rerun()
             else:
-                st.info("🔄 Traduzindo... você pode deixar esta aba aberta e usar outras abas -- a tradução continua no servidor.")
+                pct = active_job.get("pct", 0)
+                done = active_job.get("done", 0)
+                total = active_job.get("estimated_total", 1)
+                overflowed = active_job.get("overflowed", False)
+                elapsed = active_job.get("elapsed_s", 0.0)
+                eta = active_job.get("eta_s")
 
-            st.progress(pct / 100)
-            total_display = f"{done}/~{total}+" if overflowed else f"{done}/{total}"
-            eta_display = "calculando..." if overflowed or eta is None else f"{eta:.0f}s"
-            st.caption(f"{total_display} chamadas ao Ollama • decorrido: {elapsed:.0f}s • restante estimado: {eta_display}")
+                if done == 0:
+                    st.info("⏳ Iniciando -- extraindo texto do PDF e conectando ao Ollama...")
+                else:
+                    st.info("🔄 Traduzindo... você pode deixar esta ABA DO NAVEGADOR aberta e usar outras abas -- a tradução continua no servidor (mas não feche o terminal do PowerShell).")
 
-            time.sleep(2)
-            st.rerun()
+                st.progress(pct / 100)
+                total_display = f"{done}/~{total}+" if overflowed else f"{done}/{total}"
+                eta_display = "calculando..." if overflowed or eta is None else f"{eta:.0f}s"
+                st.caption(f"{total_display} chamadas ao Ollama • decorrido: {elapsed:.0f}s • restante estimado: {eta_display}")
+
+                time.sleep(2)
+                st.rerun()
 
         elif status == "done":
             st.success(
@@ -383,6 +470,45 @@ with status_box:
                 mime="text/markdown",
                 use_container_width=True,
             )
+
+            if active_job.get("pdf_saved_path"):
+                pdf_file_path = Path(active_job["pdf_saved_path"])
+                if pdf_file_path.exists():
+                    st.download_button(
+                        "⬇️ Baixar tradução (.pdf)",
+                        data=pdf_file_path.read_bytes(),
+                        file_name=active_job["pdf_filename"],
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning(
+                        f"O arquivo PDF gerado não foi encontrado em `{pdf_file_path}` "
+                        "(pode ter sido movido/apagado, ou você está rodando o app de "
+                        "uma pasta diferente da que gerou este resultado)."
+                    )
+            elif active_job.get("pdf_error"):
+                st.warning(f"PDF não gerado: {active_job['pdf_error']}")
+
+            if active_job.get("html_saved_path"):
+                html_file_path = Path(active_job["html_saved_path"])
+                if html_file_path.exists():
+                    st.download_button(
+                        "⬇️ Baixar tradução (.html)",
+                        data=html_file_path.read_bytes(),
+                        file_name=active_job["html_filename"],
+                        mime="text/html",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning(
+                        f"O arquivo HTML gerado não foi encontrado em `{html_file_path}` "
+                        "(pode ter sido movido/apagado, ou você está rodando o app de "
+                        "uma pasta diferente da que gerou este resultado)."
+                    )
+            elif active_job.get("html_error"):
+                st.warning(f"HTML não gerado: {active_job['html_error']}")
+
             with st.expander("Pré-visualizar"):
                 st.markdown(active_job["markdown"][:5000])
                 if len(active_job["markdown"]) > 5000:
