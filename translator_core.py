@@ -200,6 +200,11 @@ _NUMBERED_HEADING_RE = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,2})\.?\s+([A-ZÀ-Ý
 # extract_text_with_headings().
 _HEADINGS_SANITY_RATIO = 1.3
 
+# Limiar de ocorrências do padrão de corrupção de caracteres (ver checagem de
+# sanidade 2 em extract_text_with_headings()) para disparar o recuo. Usamos 2
+# em vez de 1 como margem de segurança contra um falso positivo isolado.
+_HEADINGS_CORRUPTION_THRESHOLD = 2
+
 
 def extract_text_with_headings(
     pdf_path: Path,
@@ -331,19 +336,25 @@ def extract_text_with_headings(
 
     result_text = "\n\n".join(chunks)
 
-    # Checagem de sanidade: alguns PDFs (encontrado num artigo real, aparentemente
-    # por causa de uma segunda "camada" de texto sobreposta no mesmo PDF, comum
-    # em PDFs gerados via certas pipelines de LaTeX) fazem o visitor_text capturar
-    # MUITO mais texto que a extração simples -- na prática, o mesmo conteúdo
-    # duplicado, às vezes com caracteres corrompidos numa das cópias (ex: um
-    # e-mail virando "goog/l.Vare.com" em vez de "google.com"). Isso não é uma
-    # duplicação previsível o suficiente para "consertar" de forma confiável
-    # (tentamos e desistimos -- ver histórico do projeto), então a proteção é
-    # recuar automaticamente para a extração simples (comprovadamente estável)
-    # sempre que o resultado parecer suspeito demais, em vez de arriscar
-    # entregar um documento com conteúdo duplicado silenciosamente.
+    # Checagem de sanidade 1: duplicação de conteúdo. Alguns PDFs (encontrado
+    # num artigo real, aparentemente por causa de uma segunda "camada" de
+    # texto sobreposta no mesmo PDF, comum em PDFs gerados via certas
+    # pipelines de LaTeX) fazem o visitor_text capturar MUITO mais texto que
+    # a extração simples -- na prática, o mesmo conteúdo duplicado. Isso não
+    # é uma duplicação previsível o suficiente para "consertar" de forma
+    # confiável (tentamos e desistimos -- ver histórico do projeto), então a
+    # proteção é recuar automaticamente para a extração simples (comprovadamente
+    # estável) sempre que o resultado parecer suspeito demais.
+    #
+    # 'final_text' é o texto que REALMENTE será retornado -- pode ser o
+    # resultado com cabeçalhos, ou o recuo para a extração simples. A
+    # checagem de sanidade 2 (corrupção de caracteres), logo abaixo, roda
+    # sobre 'final_text', não sobre 'result_text' -- importante, porque
+    # descobrimos que a corrupção pode aparecer mesmo depois do recuo (ela
+    # não é exclusiva do caminho com cabeçalhos, ver nota na checagem 2).
     plain_word_count = len(extract_text(pdf_path, page_range).split())
     headings_word_count = len(result_text.split())
+    final_text = result_text
     if plain_word_count > 0 and headings_word_count / plain_word_count > _HEADINGS_SANITY_RATIO:
         import warnings
 
@@ -356,9 +367,50 @@ def extract_text_with_headings(
             "cabeçalhos, para este documento.",
             stacklevel=2,
         )
-        return extract_text(pdf_path, page_range)
+        final_text = extract_text(pdf_path, page_range)
 
-    return result_text
+    # Checagem de sanidade 2: corrupção de caracteres. IMPORTANTE -- ao
+    # contrário da checagem 1 (duplicação), esta NÃO recua para nada,
+    # porque descobrimos (testando com um PDF real) que a corrupção também
+    # aparece na extração SIMPLES para certos PDFs -- não é um problema
+    # exclusivo do visitor_text, é uma limitação do próprio pypdf ao
+    # decodificar a fonte de alguns documentos (provavelmente uma ligadura
+    # tipográfica, ex: "fi"/"fl"/"gl", mapeada para o caractere errado).
+    # Recuar não ajudaria em nada nesse caso -- só serviria para avisar o
+    # usuário que ESSE PDF específico tem uma limitação conhecida do pypdf,
+    # presente em qualquer método de extração -- por isso a checagem roda
+    # sobre 'final_text' (o que vai ser usado de fato), não sobre
+    # 'result_text' (que pode já ter sido descartado pela checagem 1). O
+    # sinal usado aqui: ponto seguido IMEDIATAMENTE de maiúscula, sem espaço
+    # -- bem incomum em prosa normal (frases terminam com ponto seguido de
+    # espaço), mas comum nesse tipo de corrupção. Excluímos códigos de
+    # categoria do arXiv entre colchetes (ex: "[cs.CL]"), que batem no
+    # mesmo padrão mas são legítimos.
+    suspicious_count = 0
+    for m in re.finditer(r"[a-zà-ú]\.[A-ZÀ-Ú]", final_text):
+        before = final_text[max(0, m.start() - 4) : m.start()]
+        after = final_text[m.end() : m.end() + 4]
+        if "[" in before and "]" in after:
+            continue
+        suspicious_count += 1
+
+    if suspicious_count >= _HEADINGS_CORRUPTION_THRESHOLD:
+        import warnings
+
+        warnings.warn(
+            f"{suspicious_count} ocorrências de um padrão associado a corrupção de "
+            "caracteres (ponto colado numa maiúscula, ex: 'goog/l.Vare.com' em vez "
+            "de 'google.com') foram encontradas neste PDF. Isso é uma limitação "
+            "conhecida do pypdf ao decodificar a fonte de alguns documentos "
+            "(provavelmente uma ligadura tipográfica mapeada incorretamente) -- "
+            "presente tanto na extração simples quanto na detecção de cabeçalhos, "
+            "então NÃO há recuo automático aqui (não adiantaria). Revise "
+            "manualmente e-mails/textos com barras ('/') incomuns no resultado "
+            "final antes de usar.",
+            stacklevel=2,
+        )
+
+    return final_text
 
 
 def parse_page_range(value: Optional[str]) -> Optional[tuple[int, int]]:

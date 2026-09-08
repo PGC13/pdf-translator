@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -208,20 +209,31 @@ def _run_translation_job(
 
     try:
         logger.info(f"[job {job_id}] Chamando translate_document()...")
-        result = asyncio.run(
-            translate_document(
-                pdf_path=pdf_path,
-                source=source,
-                target=target,
-                model_size=model_size,
-                page_range=page_range,
-                chunk_size=chunk_size,
-                timeout=timeout,
-                progress_callback=on_progress,
-                detect_headings=detect_headings,
-                cancel_check=lambda: bool((_get_job(job_id) or {}).get("cancel_requested")),
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            result = asyncio.run(
+                translate_document(
+                    pdf_path=pdf_path,
+                    source=source,
+                    target=target,
+                    model_size=model_size,
+                    page_range=page_range,
+                    chunk_size=chunk_size,
+                    timeout=timeout,
+                    progress_callback=on_progress,
+                    detect_headings=detect_headings,
+                    cancel_check=lambda: bool((_get_job(job_id) or {}).get("cancel_requested")),
+                )
             )
-        )
+        # catch_warnings(record=True) intercepta ANTES do logging.captureWarnings
+        # (configurado lá em cima), então precisamos logar manualmente aqui --
+        # senão esses avisos específicos (duplicação/corrupção de conteúdo na
+        # detecção de cabeçalhos) só apareceriam no terminal do CLI, nunca no
+        # web_app.log nem na tela da interface web.
+        extraction_warnings = [str(w.message) for w in caught_warnings]
+        for msg in extraction_warnings:
+            logger.warning(f"[job {job_id}] {msg}")
+
         logger.info(f"[job {job_id}] translate_document() retornou com sucesso. {result.ollama_calls} chamadas, {result.elapsed_s:.1f}s")
         final_markdown = build_output_markdown(
             original_stem, source, target, f"translategemma:{model_size}", result.markdown
@@ -281,6 +293,7 @@ def _run_translation_job(
             html_filename=f"{original_stem}.{model_size}.html" if html_saved_path else None,
             html_saved_path=html_saved_path,
             html_error=html_error,
+            extraction_warnings=extraction_warnings,
         )
         logger.info(f"[job {job_id}] Status atualizado para 'done'.")
     except TranslationCancelledError:
@@ -552,6 +565,10 @@ with status_box:
                 f"({active_job['ollama_calls']} chamada(s) ao Ollama, ~{active_job['word_count']} palavras). "
                 f"Salvo automaticamente em `{active_job.get('saved_path', 'output/')}`."
             )
+
+            for warning_msg in active_job.get("extraction_warnings") or []:
+                st.warning(f"⚠️ {warning_msg}")
+
             st.download_button(
                 "⬇️ Baixar tradução (.md)",
                 data=active_job["markdown"].encode("utf-8"),

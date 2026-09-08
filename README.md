@@ -465,15 +465,22 @@ python translate_pdf.py input/artigo.pdf --source en --target pt --detect-headin
 - **Alguns PDFs têm uma segunda "camada" de texto sobreposta** (visto num
   artigo real, aparentemente comum em certas pipelines de geração de PDF via
   LaTeX) -- a API mais profunda usada aqui (`visitor_text`) captura as duas
-  camadas, quase dobrando o conteúdo, às vezes com caracteres corrompidos
-  numa das cópias (ex: um e-mail virando `goog/l.Vare.com` em vez de
-  `google.com`). Como isso não é uma duplicação previsível o suficiente para
-  corrigir de forma confiável, o script tem uma **checagem de sanidade
-  automática**: se a extração com cabeçalhos resultar em muito mais palavras
-  que a extração simples do mesmo PDF (mais de 1,3x), ele **recua
+  camadas, quase dobrando o conteúdo. O script tem uma **checagem de
+  sanidade automática**: se a extração com cabeçalhos resultar em muito mais
+  palavras que a extração simples do mesmo PDF (mais de 1,3x), ele **recua
   automaticamente** para a extração simples, sem cabeçalhos, para aquele
   documento -- evitando entregar um resultado duplicado silenciosamente. Um
   aviso é registrado em `web_app.log` quando isso acontece.
+- **Alguns PDFs têm caracteres corrompidos em certos trechos** (ex: um
+  e-mail virando `goog/l.Vare.com` em vez de `google.com`, provavelmente uma
+  ligadura tipográfica que o `pypdf` decodifica errado) -- **e essa
+  limitação não é exclusiva da detecção de cabeçalhos**: testamos e
+  confirmamos que a extração simples do mesmo PDF sofre do mesmo problema.
+  Por isso, ao contrário da duplicação acima, não existe recuo automático
+  para esse caso (recuar para a extração simples não ajudaria, já que ela
+  também está afetada) -- o script apenas **avisa** em `web_app.log` quando
+  detecta esse padrão, para que você revise manualmente e-mails/trechos com
+  barras (`/`) incomuns no resultado antes de usar.
 
 Diferente do problema da heurística de comprimento de linha (que causava
 fragmentação excessiva e explosão no número de chamadas à API), esses são

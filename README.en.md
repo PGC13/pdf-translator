@@ -465,15 +465,22 @@ python translate_pdf.py input/artigo.pdf --source en --target pt --detect-headin
 - **Some PDFs have a second, overlapping text "layer"** (found in a real
   paper, apparently common with certain LaTeX-based PDF generation
   pipelines) -- the deeper API used here (`visitor_text`) captures both
-  layers, nearly doubling the content, sometimes with corrupted characters
-  in one of the copies (e.g. an email turning into `goog/l.Vare.com`
-  instead of `google.com`). Since this isn't a predictable enough
-  duplication to reliably fix, the script has an **automatic sanity
-  check**: if heading-based extraction results in far more words than plain
-  extraction of the same PDF (more than 1.3x), it **automatically falls
-  back** to plain extraction, without headings, for that document --
-  avoiding silently delivering duplicated content. A warning is logged to
-  `web_app.log` when this happens.
+  layers, nearly doubling the content. The script has an **automatic
+  sanity check**: if heading-based extraction results in far more words
+  than plain extraction of the same PDF (more than 1.3x), it
+  **automatically falls back** to plain extraction, without headings, for
+  that document -- avoiding silently delivering duplicated content. A
+  warning is logged to `web_app.log` when this happens.
+- **Some PDFs have corrupted characters in certain passages** (e.g. an
+  email turning into `goog/l.Vare.com` instead of `google.com`, likely a
+  typographic ligature that `pypdf` decodes incorrectly) -- **and this
+  limitation isn't specific to heading detection**: we tested and confirmed
+  plain extraction of the same PDF suffers the same issue. So, unlike the
+  duplication above, there's no automatic fallback for this case (falling
+  back to plain extraction wouldn't help, since it's affected too) -- the
+  script only **warns** in `web_app.log` when it detects this pattern, so
+  you can manually review emails/passages with unusual slashes (`/`) in the
+  result before using it.
 
 Unlike the line-length heuristic problem (which caused excessive
 fragmentation and an explosion in API call count), these are much milder
