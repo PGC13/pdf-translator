@@ -34,6 +34,7 @@ from translator_core import (
     HtmlConversionError,
     PdfConversionError,
     Progress,
+    TranslationCancelledError,
     build_output_markdown,
     convert_markdown_to_html,
     convert_markdown_to_pdf,
@@ -67,6 +68,16 @@ if not logger.handlers:
     _console_handler.setFormatter(_formatter)
     logger.addHandler(_console_handler)
 
+    # translator_core.py usa warnings.warn() para avisos operacionais (ex: o
+    # recuo automático da detecção de cabeçalhos quando o resultado parece
+    # suspeito). Por padrão isso só vai pro stderr do processo; redirecionamos
+    # também para o mesmo log em arquivo, consistente com todo o resto.
+    logging.captureWarnings(True)
+    _py_warnings_logger = logging.getLogger("py.warnings")
+    _py_warnings_logger.setLevel(logging.WARNING)
+    _py_warnings_logger.addHandler(_file_handler)
+    _py_warnings_logger.addHandler(_console_handler)
+
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pdf-translator-web"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -90,6 +101,17 @@ JOBS_DIR = UPLOAD_DIR / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 _LATEST_POINTER_FILE = JOBS_DIR / "_latest.txt"
 
+# Protege o ciclo leitura-modificação-escrita de _set_job contra condição de
+# corrida entre a thread principal do Streamlit (que escreve cancel_requested
+# ao clicar em "Cancelar") e a thread de tradução em segundo plano (que
+# escreve o progresso a cada chamada ao Ollama). Sem isso, as duas podem ler
+# o arquivo "ao mesmo tempo" (antes da outra escrever), e quem escrever por
+# último apaga sem querer a mudança da outra -- foi exatamente isso que
+# fazia o cancelamento "sumir": a thread de tradução, escrevendo progresso
+# com muita frequência, reescrevia por cima do cancel_requested=True antes
+# da checagem seguinte conseguir vê-lo.
+_JOB_FILE_LOCK = threading.Lock()
+
 
 def _job_file(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
@@ -97,35 +119,36 @@ def _job_file(job_id: str) -> Path:
 
 def _set_job(job_id: str, **updates) -> None:
     path = _job_file(job_id)
-    current: dict = {}
-    if path.exists():
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            current = {}
-    current.update(updates)
-    # Registra sempre quando foi a última escrita -- usado para detectar jobs
-    # "fantasma" (status="running" travado para sempre porque o processo que
-    # fazia a tradução morreu no meio, ex: terminal fechado à força). Sem
-    # isso, reabrir a interface volta a mostrar eternamente "traduzindo...",
-    # mesmo que a thread real já não exista mais.
-    current["last_update"] = time.time()
-    # Escreve num arquivo temporário e renomeia por cima (operação atômica no
-    # mesmo sistema de arquivos), evitando ler um arquivo pela metade caso
-    # duas coisas tentem escrever ao mesmo tempo.
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(current), encoding="utf-8")
-    tmp_path.replace(path)
+    with _JOB_FILE_LOCK:
+        current: dict = {}
+        if path.exists():
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                current = {}
+        current.update(updates)
+        # Registra sempre quando foi a última escrita -- usado para detectar
+        # jobs "fantasma" (status="running" travado para sempre porque o
+        # processo que fazia a tradução morreu no meio, ex: terminal fechado
+        # à força). Sem isso, reabrir a interface volta a mostrar eternamente
+        # "traduzindo...", mesmo que a thread real já não exista mais.
+        current["last_update"] = time.time()
+        # Escreve num arquivo temporário e renomeia por cima (atômico no
+        # mesmo sistema de arquivos).
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(current), encoding="utf-8")
+        tmp_path.replace(path)
 
 
 def _get_job(job_id: str) -> Optional[dict]:
     path = _job_file(job_id)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+    with _JOB_FILE_LOCK:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
 
 
 def _set_latest_job_id(job_id: Optional[str]) -> None:
@@ -154,6 +177,7 @@ def _run_translation_job(
     timeout: Optional[float],
     generate_pdf: bool = False,
     generate_html: bool = False,
+    detect_headings: bool = False,
 ) -> None:
     """Executa a tradução numa thread separada. Roda seu próprio event loop
     asyncio (independente do event loop principal do Streamlit).
@@ -194,6 +218,8 @@ def _run_translation_job(
                 chunk_size=chunk_size,
                 timeout=timeout,
                 progress_callback=on_progress,
+                detect_headings=detect_headings,
+                cancel_check=lambda: bool((_get_job(job_id) or {}).get("cancel_requested")),
             )
         )
         logger.info(f"[job {job_id}] translate_document() retornou com sucesso. {result.ollama_calls} chamadas, {result.elapsed_s:.1f}s")
@@ -257,6 +283,9 @@ def _run_translation_job(
             html_error=html_error,
         )
         logger.info(f"[job {job_id}] Status atualizado para 'done'.")
+    except TranslationCancelledError:
+        logger.info(f"[job {job_id}] Tradução cancelada pelo usuário.")
+        _set_job(job_id, status="cancelled")
     except Exception as exc:  # noqa: BLE001 -- queremos capturar e mostrar qualquer erro na UI
         logger.exception(f"[job {job_id}] ERRO durante a tradução:")
         _set_job(job_id, status="error", error=str(exc))
@@ -286,6 +315,25 @@ is_running = active_job is not None and active_job.get("status") == "running"
 # específico de formulário que possa interferir na comunicação com o servidor.
 
 uploaded_file = st.file_uploader("PDF de entrada", type=["pdf"], disabled=is_running)
+
+if uploaded_file is not None:
+    # A key inclui nome+tamanho do arquivo, então trocar de PDF reseta esse
+    # campo para o novo nome detectado -- editar o texto não é perdido só
+    # por causa de um rerun do Streamlit (só quando o arquivo muda de verdade).
+    output_name = st.text_input(
+        "Nome do arquivo de saída (opcional)",
+        value=Path(uploaded_file.name).stem,
+        key=f"output_name_{uploaded_file.name}_{uploaded_file.size}",
+        disabled=is_running,
+        help=(
+            "Detectado automaticamente a partir do nome do arquivo enviado. "
+            "Se aparecer estranho ou truncado (ex: nomes curtos estilo "
+            "Windows, tipo 'ABCDEF~1'), corrija aqui -- isso não afeta a "
+            "tradução em si, só o nome do arquivo salvo em output/."
+        ),
+    )
+else:
+    output_name = ""
 
 col1, col2 = st.columns(2)
 with col1:
@@ -352,6 +400,19 @@ with st.expander("Opções avançadas"):
             "'markdown' (já incluída em requirements.txt)."
         ),
     )
+    detect_headings = st.checkbox(
+        "Detectar títulos/subtítulos (experimental)",
+        value=False,
+        disabled=is_running,
+        help=(
+            "Tenta reconstruir títulos/subtítulos como cabeçalhos Markdown "
+            "reais, pelo tamanho da fonte no PDF, em vez de tratar tudo como "
+            "texto corrido. Pode ocasionalmente classificar errado uma linha "
+            "(ex: autores) como cabeçalho de baixo nível, se ela tiver o "
+            "mesmo tamanho de fonte de um subtítulo real -- veja o README "
+            "para detalhes. Desativado por padrão."
+        ),
+    )
 
 submitted = st.button("Traduzir", disabled=is_running, use_container_width=True, type="primary")
 
@@ -366,6 +427,12 @@ if submitted:
             pdf_path = UPLOAD_DIR / f"{job_id}.pdf"
             pdf_path.write_bytes(uploaded_file.getvalue())
             logger.info(f"[job {job_id}] PDF salvo em {pdf_path} ({pdf_path.stat().st_size} bytes)")
+
+            # Usa o nome customizado pelo usuário (se preenchido) em vez do
+            # nome bruto reportado pelo navegador -- protege contra casos em
+            # que o SO/navegador reporta um "apelido" curto/truncado (ex:
+            # nomes estilo Windows 8.3, tipo "ABCDEF~1") em vez do nome real.
+            effective_filename = f"{output_name.strip()}.pdf" if output_name and output_name.strip() else uploaded_file.name
 
             _set_job(
                 job_id,
@@ -386,7 +453,7 @@ if submitted:
                 kwargs=dict(
                     job_id=job_id,
                     pdf_path=pdf_path,
-                    original_filename=uploaded_file.name,
+                    original_filename=effective_filename,
                     source=source,
                     target=target,
                     model_size=model_size,
@@ -395,6 +462,7 @@ if submitted:
                     timeout=(timeout or None),
                     generate_pdf=generate_pdf,
                     generate_html=generate_html,
+                    detect_headings=detect_headings,
                 ),
                 daemon=True,
                 name=f"translate-{job_id[:8]}",
@@ -443,8 +511,16 @@ with status_box:
                 overflowed = active_job.get("overflowed", False)
                 elapsed = active_job.get("elapsed_s", 0.0)
                 eta = active_job.get("eta_s")
+                cancel_requested = active_job.get("cancel_requested", False)
 
-                if done == 0:
+                if cancel_requested:
+                    st.info(
+                        "⏹️ Cancelamento solicitado -- aguardando o fim da chamada "
+                        "atual ao Ollama (o cancelamento não é instantâneo; com "
+                        "modelos maiores, uma única chamada pode levar vários "
+                        "minutos)..."
+                    )
+                elif done == 0:
                     st.info("⏳ Iniciando -- extraindo texto do PDF e conectando ao Ollama...")
                 else:
                     st.info("🔄 Traduzindo... você pode deixar esta ABA DO NAVEGADOR aberta e usar outras abas -- a tradução continua no servidor (mas não feche o terminal do PowerShell).")
@@ -453,6 +529,19 @@ with status_box:
                 total_display = f"{done}/~{total}+" if overflowed else f"{done}/{total}"
                 eta_display = "calculando..." if overflowed or eta is None else f"{eta:.0f}s"
                 st.caption(f"{total_display} chamadas ao Ollama • decorrido: {elapsed:.0f}s • restante estimado: {eta_display}")
+
+                if not cancel_requested:
+                    if st.button(
+                        "⏹️ Cancelar tradução",
+                        help=(
+                            "O cancelamento não é instantâneo: só surte efeito depois "
+                            "que a chamada em andamento ao Ollama terminar. O .md "
+                            "parcial NÃO é salvo -- a tradução precisa ser refeita do "
+                            "zero caso você queira o documento completo depois."
+                        ),
+                    ):
+                        _set_job(st.session_state.job_id, cancel_requested=True)
+                        st.rerun()
 
                 time.sleep(2)
                 st.rerun()
@@ -522,6 +611,13 @@ with status_box:
         elif status == "error":
             st.error(f"❌ Erro durante a tradução: {active_job.get('error')}")
             if st.button("Tentar novamente"):
+                st.session_state.job_id = None
+                _set_latest_job_id(None)
+                st.rerun()
+
+        elif status == "cancelled":
+            st.warning("⏹️ Tradução cancelada. Nenhum arquivo foi salvo -- a tradução precisa ser refeita do zero, se quiser o documento completo.")
+            if st.button("Nova tradução", key="new_translation_after_cancel"):
                 st.session_state.job_id = None
                 _set_latest_job_id(None)
                 st.rerun()

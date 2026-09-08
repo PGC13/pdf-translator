@@ -9,8 +9,10 @@ parágrafos, etc.) valham para os dois, sem duplicação.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -95,6 +97,270 @@ def extract_text(pdf_path: Path, page_range: Optional[tuple[int, int]]) -> str:
     return "\n\n".join(chunks)
 
 
+# --------------------------------------------------------------------------
+# Detecção opcional de títulos/cabeçalhos (por tamanho de fonte)
+# --------------------------------------------------------------------------
+#
+# A extração padrão acima (extract_text) junta tudo em texto corrido, sem
+# distinguir títulos de parágrafos comuns -- porque o pypdf.extract_text()
+# simples não preserva nenhuma informação visual, só texto puro. As funções
+# abaixo usam uma API mais profunda do pypdf (visitor_text) que revela o
+# TAMANHO REAL DA FONTE de cada trecho de texto, permitindo reconstruir
+# títulos e subtítulos como cabeçalhos Markdown de verdade (#, ##, ###).
+#
+# Isso é opcional (flag --detect-headings / checkbox na interface web), não
+# o padrão, por prudência: é uma mudança mais profunda na extração, e
+# heurísticas de estrutura de PDF já nos surpreenderam antes (ver a nota
+# técnica sobre detecção por comprimento de linha, que parecia funcionar em
+# teste sintético e falhou em PDF real). Os limiares aqui usam RANKING
+# relativo dos tamanhos de fonte (não faixas fixas), o que se mostrou mais
+# robusto em testes -- mas ainda pode errar em PDFs com formatação incomum.
+
+
+def _collect_page_fragments(page) -> list[tuple[float, str, float, bool]]:
+    """Usa a API visitor_text do pypdf para capturar cada trecho de texto da
+    página junto com sua posição vertical, o tamanho real da fonte, e se está
+    em negrito (via o nome da fonte, ex: "Helvetica-Bold") -- dados que não
+    vêm na chamada simples extract_text()."""
+    fragments: list[tuple[float, str, float, bool]] = []
+
+    def visitor(text, cm, tm, font_dict, font_size) -> None:
+        if text.strip():
+            base_font = (font_dict or {}).get("/BaseFont", "") if font_dict else ""
+            is_bold = "bold" in base_font.lower()
+            fragments.append((tm[5], text, font_size, is_bold))
+
+    page.extract_text(visitor_text=visitor)
+    return fragments
+
+
+def _group_fragments_into_lines(
+    fragments: list[tuple[float, str, float, bool]], y_tolerance: float = 2.0
+) -> list[dict]:
+    """Agrupa fragmentos que compartilham (aproximadamente) a mesma posição
+    vertical numa única linha visual -- um PDF real frequentemente separa uma
+    linha em vários fragmentos (ex: mudança de fonte no meio da linha).
+    Também acumula a proporção de caracteres em negrito na linha, usada para
+    detectar cabeçalhos que usam negrito em vez de (ou além de) fonte maior."""
+    lines: list[dict] = []
+    for y, text, size, bold in fragments:
+        placed = False
+        for line in lines:
+            if abs(line["y"] - y) <= y_tolerance:
+                line["text"] = (line["text"] + " " + text).strip()
+                line["max_size"] = max(line["max_size"], size)
+                line["bold_chars"] += len(text) if bold else 0
+                line["total_chars"] += len(text)
+                placed = True
+                break
+        if not placed:
+            lines.append(
+                {
+                    "y": y,
+                    "text": text.strip(),
+                    "max_size": size,
+                    "bold_chars": len(text) if bold else 0,
+                    "total_chars": len(text),
+                }
+            )
+    for line in lines:
+        line["bold_ratio"] = line["bold_chars"] / max(1, line["total_chars"])
+    return lines
+
+
+# Proporção mínima de caracteres em negrito, na linha inteira, para considerar
+# a linha candidata a cabeçalho por negrito (evita que UMA palavra em negrito
+# no meio de uma frase normal seja confundida com um cabeçalho).
+_BOLD_HEADING_RATIO = 0.8
+# Comprimento máximo (caracteres) para uma linha em negrito ser considerada
+# cabeçalho -- evita que um PARÁGRAFO inteiro em negrito (ex: um aviso/nota)
+# seja tratado como título.
+_BOLD_HEADING_MAX_LEN = 200
+
+
+def _is_bold_heading_candidate(line: dict) -> bool:
+    return line["bold_ratio"] >= _BOLD_HEADING_RATIO and len(line["text"]) <= _BOLD_HEADING_MAX_LEN
+
+
+# Terceiro sinal: seções numeradas sem nenhuma distinção tipográfica (nem
+# tamanho, nem negrito) -- comum em alguns PDFs onde o número da seção é a
+# única pista visual (ex: "1. Introdução", "2.1 Coleta de Dados"). Detecta
+# pelo PADRÃO do texto, não por metadado do PDF -- por isso é o sinal mais
+# arriscado dos três: uma lista numerada de verdade ("1. Item\n2. Item\n3.
+# Item") teria o mesmo formato de texto. A proteção contra isso é: só conta
+# como cabeçalho se a linha vizinha (antes E depois) NÃO bater no mesmo
+# padrão -- cabeçalhos de seção aparecem isolados, cercados de texto de
+# corpo; itens de lista aparecem em sequência, um atrás do outro.
+_NUMBERED_HEADING_RE = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,2})\.?\s+([A-ZÀ-Ý][^\n]{1,60})$")
+
+# Limiar de sanidade: se a extração com detecção de cabeçalhos resultar em
+# mais que essa proporção de palavras em relação à extração simples, é sinal
+# de provável duplicação de conteúdo (encontrado em teste real com um PDF que
+# tinha uma segunda camada de texto sobreposta) -- ver a checagem no final de
+# extract_text_with_headings().
+_HEADINGS_SANITY_RATIO = 1.3
+
+
+def extract_text_with_headings(
+    pdf_path: Path,
+    page_range: Optional[tuple[int, int]] = None,
+    min_heading_ratio: float = 1.15,
+    max_heading_levels: int = 3,
+) -> str:
+    """Como extract_text(), mas tenta reconstruir títulos/subtítulos como
+    cabeçalhos Markdown reais, detectados pelo tamanho da fonte (não pelo
+    comprimento da linha, que já vimos ser pouco confiável).
+
+    O nível de cada cabeçalho é definido pelo RANKING dos tamanhos de fonte
+    distintos encontrados no documento inteiro (não por página, para evitar
+    viés da primeira página, que costuma ter menos corpo de texto real
+    proporcionalmente a título/autores) -- o maior tamanho vira nível 1, o
+    segundo maior vira nível 2, etc. Só é considerado cabeçalho um tamanho
+    pelo menos `min_heading_ratio` maior que o tamanho predominante do corpo
+    do texto, para evitar falsos positivos (ex: uma linha de autores só um
+    pouco maior que o corpo não deveria virar "cabeçalho").
+
+    Os níveis de cabeçalho são deslocados (+2) no Markdown final para não
+    colidir com o "## Página N" que já demarca cada página.
+    """
+    reader = PdfReader(str(pdf_path))
+    total_pages = len(reader.pages)
+
+    start, end = (1, total_pages) if page_range is None else page_range
+    start = max(1, start)
+    end = min(total_pages, end)
+
+    if start > end:
+        raise ValueError(f"Intervalo de páginas inválido: {start}-{end} (PDF tem {total_pages} páginas)")
+
+    # Primeira passada: coleta as linhas de TODAS as páginas do intervalo,
+    # necessário para calcular o tamanho do corpo do documento inteiro antes
+    # de classificar qualquer linha individualmente.
+    pages_lines: list[list[dict]] = []
+    all_lines: list[dict] = []
+    for i in range(start - 1, end):
+        fragments = _collect_page_fragments(reader.pages[i])
+        lines = _group_fragments_into_lines(fragments)
+        pages_lines.append(lines)
+        all_lines.extend(lines)
+
+    if not any(line["text"] for lines in pages_lines for line in lines):
+        raise ValueError(
+            "Nenhum texto extraído. O PDF pode ser escaneado (imagem) e precisar de OCR "
+            "(ex: Tesseract) antes da tradução."
+        )
+
+    # Tamanho do corpo do texto: o mais comum, ponderado por quantidade de
+    # caracteres (corpo de texto real sempre domina em volume sobre
+    # títulos/cabeçalhos, que são curtos).
+    size_weight: Counter = Counter()
+    for line in all_lines:
+        if line["text"]:
+            size_weight[round(line["max_size"])] += len(line["text"])
+    body_size = size_weight.most_common(1)[0][0]
+
+    candidate_sizes = sorted(
+        {round(line["max_size"]) for line in all_lines if round(line["max_size"]) / body_size >= min_heading_ratio},
+        reverse=True,
+    )
+    size_to_level = {size: min(i + 1, max_heading_levels) for i, size in enumerate(candidate_sizes)}
+    # Cabeçalhos detectados só por negrito (mesmo tamanho do corpo -- padrão
+    # comum em muitos artigos acadêmicos) ficam no próximo nível disponível
+    # depois de todos os detectados por tamanho, já que não há como saber sua
+    # posição hierárquica só pelo negrito.
+    bold_only_level = min(len(candidate_sizes) + 1, max_heading_levels)
+
+    # Segunda passada: monta o Markdown final, com cabeçalhos reais
+    # intercalados com parágrafos de corpo reconstruídos (reaproveitando a
+    # mesma lógica de rejoin_wrapped_lines para o texto entre cabeçalhos).
+    chunks = []
+    for page_num, lines in zip(range(start, end + 1), pages_lines):
+        lines = [line for line in lines if line["text"]]
+        if not lines:
+            continue
+
+        # Classifica cada linha pelos sinais mais confiáveis primeiro
+        # (tamanho, depois negrito).
+        line_levels = []
+        for line in lines:
+            level = size_to_level.get(round(line["max_size"]), 0)
+            if level == 0 and _is_bold_heading_candidate(line):
+                level = bold_only_level
+            line_levels.append(level)
+
+        # Terceiro sinal (padrão de seção numerada) só para linhas ainda sem
+        # classificação -- e só conta se a linha vizinha (antes E depois)
+        # não bater no mesmo padrão (ver nota acima sobre listas numeradas).
+        pattern_matches = [
+            _NUMBERED_HEADING_RE.match(line["text"]) if level == 0 else None
+            for line, level in zip(lines, line_levels)
+        ]
+        for i, match in enumerate(pattern_matches):
+            if match is None:
+                continue
+            prev_matches = pattern_matches[i - 1] is not None if i > 0 else False
+            next_matches = pattern_matches[i + 1] is not None if i < len(pattern_matches) - 1 else False
+            if prev_matches or next_matches:
+                continue
+            depth = match.group(1).count(".") + 1
+            line_levels[i] = min(bold_only_level + (depth - 1), max_heading_levels)
+
+        blocks: list[tuple] = []
+        body_run: list[str] = []
+        for line, level in zip(lines, line_levels):
+            if level > 0:
+                if body_run:
+                    blocks.append(("body", "\n".join(body_run)))
+                    body_run = []
+                blocks.append(("heading", level, line["text"]))
+            else:
+                body_run.append(line["text"])
+        if body_run:
+            blocks.append(("body", "\n".join(body_run)))
+
+        page_parts = [f"## Página {page_num}"]
+        for block in blocks:
+            if block[0] == "heading":
+                _, level, text = block
+                md_level = "#" * (level + 2)
+                page_parts.append(f"{md_level} {text}")
+            else:
+                _, text = block
+                page_parts.append(rejoin_wrapped_lines(text))
+        chunks.append("\n\n".join(page_parts))
+
+    result_text = "\n\n".join(chunks)
+
+    # Checagem de sanidade: alguns PDFs (encontrado num artigo real, aparentemente
+    # por causa de uma segunda "camada" de texto sobreposta no mesmo PDF, comum
+    # em PDFs gerados via certas pipelines de LaTeX) fazem o visitor_text capturar
+    # MUITO mais texto que a extração simples -- na prática, o mesmo conteúdo
+    # duplicado, às vezes com caracteres corrompidos numa das cópias (ex: um
+    # e-mail virando "goog/l.Vare.com" em vez de "google.com"). Isso não é uma
+    # duplicação previsível o suficiente para "consertar" de forma confiável
+    # (tentamos e desistimos -- ver histórico do projeto), então a proteção é
+    # recuar automaticamente para a extração simples (comprovadamente estável)
+    # sempre que o resultado parecer suspeito demais, em vez de arriscar
+    # entregar um documento com conteúdo duplicado silenciosamente.
+    plain_word_count = len(extract_text(pdf_path, page_range).split())
+    headings_word_count = len(result_text.split())
+    if plain_word_count > 0 and headings_word_count / plain_word_count > _HEADINGS_SANITY_RATIO:
+        import warnings
+
+        warnings.warn(
+            f"Detecção de cabeçalhos produziu {headings_word_count} palavras contra "
+            f"{plain_word_count} da extração simples (proporção "
+            f"{headings_word_count / plain_word_count:.2f}x) -- sinal de possível "
+            "duplicação de conteúdo (visto em PDFs com camadas de texto sobrepostas). "
+            "Recuando automaticamente para a extração simples, sem detecção de "
+            "cabeçalhos, para este documento.",
+            stacklevel=2,
+        )
+        return extract_text(pdf_path, page_range)
+
+    return result_text
+
+
 def parse_page_range(value: Optional[str]) -> Optional[tuple[int, int]]:
     if value is None:
         return None
@@ -127,6 +393,14 @@ class TranslationResult:
     ollama_calls: int
     elapsed_s: float
     word_count: int
+
+
+class TranslationCancelledError(RuntimeError):
+    """Levantado quando o cancelamento é solicitado (via cancel_check) entre
+    duas chamadas ao Ollama. O cancelamento é cooperativo, não instantâneo:
+    se uma chamada já está em andamento, ela termina normalmente antes do
+    cancelamento surtir efeito -- não há forma segura de interromper uma
+    chamada HTTP já em voo sem risco de deixar conexões/estado pela metade."""
 
 
 ProgressCallback = Callable[[Progress], None]
@@ -178,12 +452,29 @@ async def translate_document(
     chunk_size: Optional[int] = None,
     timeout: Optional[float] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    detect_headings: bool = False,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> TranslationResult:
     """Extrai e traduz um PDF, chamando progress_callback (se fornecido) a cada
     chamada concluída ao Ollama. Não escreve nenhum arquivo -- isso fica a
     cargo de quem chamar (CLI ou interface web), já que cada um decide o
-    destino de forma diferente."""
-    source_md = extract_text(pdf_path, page_range)
+    destino de forma diferente.
+
+    'detect_headings' ativa a extração experimental que reconstrói títulos e
+    subtítulos como cabeçalhos Markdown reais (por tamanho de fonte), em vez
+    de tratar tudo como texto corrido. Desativado por padrão -- veja a
+    documentação de extract_text_with_headings() para as limitações
+    conhecidas dessa detecção.
+
+    'cancel_check', se fornecido, é chamado antes de CADA chamada ao Ollama;
+    se retornar True, a tradução é interrompida (levanta
+    TranslationCancelledError) antes de iniciar a próxima chamada. O
+    cancelamento é cooperativo -- uma chamada já em andamento sempre termina
+    normalmente antes do cancelamento surtir efeito."""
+    if detect_headings:
+        source_md = extract_text_with_headings(pdf_path, page_range)
+    else:
+        source_md = extract_text(pdf_path, page_range)
     word_count = len(source_md.split())
 
     model = f"translategemma:{model_size}"
@@ -200,6 +491,8 @@ async def translate_document(
     original_generate = _polyglot_ollama.OllamaClient.generate
 
     async def _patched_generate(self, req):
+        if cancel_check is not None and cancel_check():
+            raise TranslationCancelledError("Tradução cancelada pelo usuário.")
         response = await original_generate(self, req)
         state["completed"] += 1
         done = state["completed"]
@@ -238,20 +531,28 @@ async def translate_document(
             TranslateMarkdownOptions(model=model, batch_char_limit=chunk_size),
         )
     finally:
+        # Restaurar os patches é sempre necessário, mesmo se cancelado ou se
+        # der erro -- senão a correção "vaza" para chamadas futuras que usem
+        # a mesma classe compartilhada da biblioteca.
         _polyglot_ollama.OllamaClient.generate = original_generate
         _polyglot_ollama.OllamaClient._get_client = original_get_client
-        elapsed = time.monotonic() - start_time
-        if progress_callback is not None:
-            progress_callback(
-                Progress(
-                    done=state["completed"],
-                    estimated_total=state["completed"],
-                    overflowed=False,
-                    pct=100,
-                    elapsed_s=elapsed,
-                    eta_s=0,
-                )
+
+    # O callback de "100% concluído" só é emitido aqui, DEPOIS do bloco
+    # try/finally -- se translate_markdown levantar uma exceção (cancelamento
+    # ou erro), essas linhas não são executadas, evitando emitir um falso
+    # sinal de conclusão.
+    elapsed = time.monotonic() - start_time
+    if progress_callback is not None:
+        progress_callback(
+            Progress(
+                done=state["completed"],
+                estimated_total=state["completed"],
+                overflowed=False,
+                pct=100,
+                elapsed_s=elapsed,
+                eta_s=0,
             )
+        )
 
     return TranslationResult(
         markdown=result.markdown,

@@ -123,6 +123,7 @@ async def run(args: argparse.Namespace) -> None:
         chunk_size=args.chunk_size,
         timeout=args.timeout,
         progress_callback=printer,
+        detect_headings=args.detect_headings,
     )
 
     print(f"Texto extraído: ~{result.word_count} palavras")
@@ -216,6 +217,18 @@ def main() -> None:
             "Além do .md, também gera um .html autocontido (mesmo nome, na "
             "mesma pasta). Requer a biblioteca 'markdown' (pip install "
             "markdown) -- sem dependências externas além dessa."
+        ),
+    )
+    parser.add_argument(
+        "--detect-headings",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: tenta reconstruir títulos/subtítulos como cabeçalhos "
+            "Markdown reais, detectados pelo tamanho da fonte no PDF (em vez de "
+            "tratar tudo como texto corrido). Pode ocasionalmente classificar "
+            "errado uma linha (ex: autores) como cabeçalho de baixo nível, se "
+            "ela tiver o mesmo tamanho de fonte de um subtítulo real -- veja o "
+            "README para detalhes. Desativado por padrão."
         ),
     )
 

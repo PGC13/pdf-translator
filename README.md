@@ -76,6 +76,7 @@ pip install -r requirements.txt
 pdf-translator/
 ├── input/     # coloque aqui os PDFs que quer traduzir
 ├── output/    # as traduções em .md são salvas aqui
+├── tools/                # scripts de diagnóstico (não fazem parte do fluxo normal)
 ├── translator_core.py   # lógica compartilhada (extração + tradução)
 ├── translate_pdf.py     # interface de linha de comando
 ├── web_app.py            # interface web (Streamlit)
@@ -105,9 +106,14 @@ ou erro registrado (o Windows simplesmente mata tudo junto). Para rodar
 outro comando enquanto uma tradução está em curso, abra uma **janela nova**
 do PowerShell, sem fechar a que está rodando o Streamlit.
 
-**Limitação atual:** não há como cancelar uma tradução em andamento pela
-interface -- só é possível iniciar uma nova depois que a atual terminar
-(com sucesso ou erro).
+**Cancelar uma tradução em andamento:** clique em "⏹️ Cancelar tradução" na
+seção de status enquanto a tradução está rodando. O cancelamento é
+**cooperativo, não instantâneo** -- não existe uma forma segura de
+interromper uma chamada ao Ollama já em andamento; o cancelamento surte
+efeito só depois que a chamada atual terminar, antes de iniciar a próxima
+(o que pode levar vários minutos com modelos maiores, tipo `27b`). O `.md`
+parcial não é salvo -- a tradução precisa ser refeita do zero caso você
+queira o documento completo depois.
 
 A lógica de extração e tradução (incluindo as correções de bugs descritas
 mais abaixo) fica em `translator_core.py`, usada tanto pelo CLI quanto pela
@@ -202,6 +208,7 @@ O resultado é salvo automaticamente em `output/entrada.<model-size>.md` (ex:
 | `--timeout` | Tempo máximo (segundos) de espera por chamada ao Ollama | 60s (da biblioteca) -- veja a seção "Timeout" abaixo |
 | `--to-pdf` | Também gera um `.pdf` (requer pandoc + wkhtmltopdf) | desativado |
 | `--to-html` | Também gera um `.html` autocontido (só requer a lib `markdown`) | desativado |
+| `--detect-headings` | Experimental: reconstrói títulos/subtítulos como cabeçalhos reais (por tamanho de fonte) | desativado |
 
 ### Exemplos
 
@@ -407,12 +414,82 @@ python translate_pdf.py input/artigo.pdf --source en --target pt --to-html
 Como não depende de nada externo, é a opção mais simples das duas caso você
 só queira algo mais legível que o `.md` puro sem instalar mais nada.
 
+## Detectar títulos/subtítulos (experimental)
+
+Por padrão, o script trata título, subtítulos e corpo do texto da mesma
+forma (tudo vira texto corrido) -- é uma escolha deliberada, já que o
+`pypdf.extract_text()` simples não preserva nenhuma informação visual (só
+texto puro), e uma tentativa anterior de adivinhar a estrutura por
+comprimento de linha se mostrou pouco confiável (ver nota técnica acima).
+
+Usando isso, o script reconstrói títulos e subtítulos como cabeçalhos
+Markdown reais (`#`, `##`, `###`), usando **três sinais combinados**, do
+mais para o menos confiável:
+
+1. **Tamanho de fonte**, classificado pelo **ranking relativo** dos tamanhos
+   encontrados no documento inteiro (o maior tamanho vira nível 1, o segundo
+   maior vira nível 2, etc.) -- mais robusto que faixas fixas, já que se
+   adapta a qualquer escala de fonte do documento.
+2. **Negrito**, para pegar o padrão comum em muitos artigos acadêmicos onde
+   os cabeçalhos de seção usam o **mesmo tamanho** do corpo do texto, só em
+   negrito (invisível para o sinal de tamanho sozinho). Só conta como
+   cabeçalho se a linha inteira for majoritariamente negrito (evita confundir
+   uma palavra em destaque no meio de uma frase com um título) e não for
+   longa demais (evita confundir um parágrafo inteiro em negrito, tipo um
+   aviso, com um título).
+3. **Padrão de seção numerada** (ex: "1. Introdução", "2.1 Coleta de
+   Dados"), para PDFs onde nem tamanho nem negrito distinguem os cabeçalhos
+   do corpo -- um caso real encontrado em testes. Esse é o sinal mais
+   arriscado dos três, já que uma lista numerada de verdade (ex: "1. Item /
+   2. Item / 3. Item") tem o mesmo formato de texto; a proteção é só contar
+   como cabeçalho quando a linha vizinha (antes e depois) **não** bate no
+   mesmo padrão -- cabeçalhos de seção aparecem isolados, cercados de corpo
+   de texto, enquanto itens de lista aparecem em sequência.
+
+**CLI:**
+```bash
+python translate_pdf.py input/artigo.pdf --source en --target pt --detect-headings
+```
+
+**Interface web:** marque a caixa "Detectar títulos/subtítulos (experimental)".
+
+**Limitações conhecidas** (testadas em PDF real, não só sintético):
+- Como a classificação usa tamanho/negrito/padrão de texto, uma linha que
+  não é estruturalmente um cabeçalho (ex: uma linha de autores) mas que *por
+  acaso* compartilha o tamanho de um subtítulo genuíno pode ser classificada
+  incorretamente como cabeçalho de baixo nível.
+- **Cabeçalhos de página repetidos** (comuns em artigos publicados, ex: nome
+  da revista/conferência impresso no topo de cada página) podem ser
+  confundidos com títulos reais, já que frequentemente usam uma fonte
+  diferente do corpo do texto.
+- **Alguns PDFs têm uma segunda "camada" de texto sobreposta** (visto num
+  artigo real, aparentemente comum em certas pipelines de geração de PDF via
+  LaTeX) -- a API mais profunda usada aqui (`visitor_text`) captura as duas
+  camadas, quase dobrando o conteúdo, às vezes com caracteres corrompidos
+  numa das cópias (ex: um e-mail virando `goog/l.Vare.com` em vez de
+  `google.com`). Como isso não é uma duplicação previsível o suficiente para
+  corrigir de forma confiável, o script tem uma **checagem de sanidade
+  automática**: se a extração com cabeçalhos resultar em muito mais palavras
+  que a extração simples do mesmo PDF (mais de 1,3x), ele **recua
+  automaticamente** para a extração simples, sem cabeçalhos, para aquele
+  documento -- evitando entregar um resultado duplicado silenciosamente. Um
+  aviso é registrado em `web_app.log` quando isso acontece.
+
+Diferente do problema da heurística de comprimento de linha (que causava
+fragmentação excessiva e explosão no número de chamadas à API), esses são
+efeitos colaterais bem mais brandos: o documento continua legível, só
+ocasionalmente com uma marcação de cabeçalho imprecisa numa linha isolada
+(ou, no pior caso, recuando de forma transparente para o comportamento
+padrão). Por isso é opcional (desativado por padrão) -- teste no seu
+documento e avalie se o ganho (títulos/seções reais preservados) compensa
+esses ocasionais efeitos colaterais.
+
 ## Roadmap
 
 - [ ] Suporte a OCR automático para PDFs escaneados
 - [ ] Suporte a `.docx` como entrada
 - [ ] Cache de tradução para reprocessamento incremental
-- [ ] Cancelar tradução em andamento na interface web
+- [x] Cancelar tradução em andamento na interface web
 
 ## Contribuindo
 

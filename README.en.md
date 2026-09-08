@@ -75,6 +75,7 @@ pip install -r requirements.txt
 pdf-translator/
 ├── input/     # put the PDFs you want to translate here
 ├── output/    # translations (.md) are saved here
+├── tools/                # diagnostic scripts (not part of the normal flow)
 ├── translator_core.py   # shared logic (extraction + translation)
 ├── translate_pdf.py     # command-line interface
 ├── web_app.py            # web interface (Streamlit)
@@ -104,9 +105,14 @@ warning or logged error (Windows simply kills everything at once). To run
 another command while a translation is in progress, open a **new**
 PowerShell window instead of closing the one running Streamlit.
 
-**Current limitation:** there's no way to cancel a translation in progress
-from the interface -- you can only start a new one after the current one
-finishes (successfully or with an error).
+**Cancelling a translation in progress:** click "⏹️ Cancelar tradução" in the
+status section while the translation is running. Cancellation is
+**cooperative, not instant** -- there's no safe way to interrupt a call to
+Ollama that's already in flight; cancellation takes effect only after the
+current call finishes, before starting the next one (which can take
+several minutes with larger models, like `27b`). The partial `.md` isn't
+saved -- the translation needs to be redone from scratch if you want the
+complete document later.
 
 The extraction and translation logic (including the bug fixes described
 further below) lives in `translator_core.py`, used by both the CLI and the
@@ -201,6 +207,7 @@ The result is saved automatically to `output/entrada.<model-size>.md`
 | `--timeout` | Maximum time (seconds) to wait per call to Ollama | 60s (library default) -- see the "Timeout" section below |
 | `--to-pdf` | Also generates a `.pdf` (requires pandoc + wkhtmltopdf) | disabled |
 | `--to-html` | Also generates a self-contained `.html` (only requires the `markdown` lib) | disabled |
+| `--detect-headings` | Experimental: reconstructs titles/subtitles as real headings (by font size) | disabled |
 
 ### Examples
 
@@ -406,12 +413,82 @@ Since it depends on nothing external, this is the simpler of the two
 options if you just want something more readable than plain `.md` without
 installing anything extra.
 
+## Detect titles/subtitles (experimental)
+
+By default, the script treats title, subtitles, and body text the same way
+(everything becomes flowing prose) -- this is a deliberate choice, since
+plain `pypdf.extract_text()` preserves no visual information (just plain
+text), and an earlier attempt to guess structure by line length proved
+unreliable (see the technical note above).
+
+There is, however, a more reliable way to detect structure: `pypdf` also
+exposes the **actual font size** and **font name** (which reveals bold, e.g.
+"Helvetica-Bold") of each text fragment (via a deeper API, `visitor_text`).
+Using this, the script reconstructs titles and subtitles as real Markdown
+headings (`#`, `##`, `###`), using **three combined signals**, from most to
+least reliable:
+
+1. **Font size**, classified by the **relative ranking** of sizes found
+   across the whole document (the largest size becomes level 1, the
+   second-largest becomes level 2, etc.) -- more robust than fixed ranges,
+   since it adapts to any font scale used in the document.
+2. **Bold**, to catch the common pattern in many academic papers where
+   section headings use the **same size** as body text, just bold
+   (invisible to the size signal alone). Only counts as a heading if the
+   whole line is mostly bold (avoids confusing a single emphasized word
+   mid-sentence with a title) and isn't too long (avoids confusing an
+   entire bold paragraph, like a notice, with a title).
+3. **Numbered section pattern** (e.g. "1. Introdução", "2.1 Coleta de
+   Dados"), for PDFs where neither size nor bold distinguish headings from
+   body text -- a real case found in testing. This is the riskiest of the
+   three signals, since a genuine numbered list (e.g. "1. Item / 2. Item /
+   3. Item") has the same text shape; the safeguard is to only count it as
+   a heading when the neighboring line (before and after) does **not**
+   match the same pattern -- section headings appear isolated, surrounded
+   by body text, while list items appear in sequence, one after another.
+
+**CLI:**
+```bash
+python translate_pdf.py input/artigo.pdf --source en --target pt --detect-headings
+```
+
+**Web interface:** check the "Detectar títulos/subtítulos (experimental)" box.
+
+**Known limitations** (tested on a real PDF, not just synthetic):
+- Since classification relies on size/bold/text pattern, a line that isn't
+  structurally a heading (e.g. an author byline) but *happens* to share the
+  size of a genuine subtitle elsewhere in the document can be misclassified
+  as a low-level heading.
+- **Repeated page headers** (common in published papers, e.g. journal/venue
+  name printed at the top of every page) can be confused with real titles,
+  since they often use a font different from the body text.
+- **Some PDFs have a second, overlapping text "layer"** (found in a real
+  paper, apparently common with certain LaTeX-based PDF generation
+  pipelines) -- the deeper API used here (`visitor_text`) captures both
+  layers, nearly doubling the content, sometimes with corrupted characters
+  in one of the copies (e.g. an email turning into `goog/l.Vare.com`
+  instead of `google.com`). Since this isn't a predictable enough
+  duplication to reliably fix, the script has an **automatic sanity
+  check**: if heading-based extraction results in far more words than plain
+  extraction of the same PDF (more than 1.3x), it **automatically falls
+  back** to plain extraction, without headings, for that document --
+  avoiding silently delivering duplicated content. A warning is logged to
+  `web_app.log` when this happens.
+
+Unlike the line-length heuristic problem (which caused excessive
+fragmentation and an explosion in API call count), these are much milder
+side effects: the document stays readable, just occasionally with an
+inaccurate heading tag on an isolated line (or, worst case, transparently
+falling back to default behavior). That's why it's optional (disabled by
+default) -- test it on your document and judge whether the benefit (real
+titles/sections preserved) is worth these occasional side effects.
+
 ## Roadmap
 
 - [ ] Automatic OCR support for scanned PDFs
 - [ ] Support for `.docx` as input
 - [ ] Translation cache for incremental reprocessing
-- [ ] Cancel an in-progress translation from the web interface
+- [x] Cancel an in-progress translation from the web interface
 
 ## Contributing
 

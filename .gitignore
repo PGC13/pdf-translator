@@ -13,6 +13,8 @@ web_app.log
 
 # Saídas de tradução geradas (opcional manter fora do repo)
 output/*.md
+output/*.html
+output/*.pdf
 !output/.gitkeep
 
 # PDFs de entrada (não versionar documentos pessoais/institucionais)
